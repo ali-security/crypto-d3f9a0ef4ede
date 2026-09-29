@@ -1212,6 +1212,138 @@ func TestChannelUnexpectedResponsesDiscarded(t *testing.T) {
 	}
 }
 
+func TestChannelUndecidedOutboundDropsTraffic(t *testing.T) {
+	// Traffic on an outbound channel the peer has not confirmed yet is dropped;
+	// the open confirmation is still processed.
+	a, b := memPipe()
+	defer a.Close()
+	defer b.Close()
+	// Drain the peer end so that a write would not block.
+	go func() {
+		for {
+			if _, err := b.readPacket(); err != nil {
+				return
+			}
+		}
+	}()
+
+	m := newMux(a)
+	ch := m.newChannel("session", channelOutbound, nil)
+	if ch.decided {
+		t.Fatal("freshly opened outbound channel should not be decided")
+	}
+
+	// Flooding channel requests must not block.
+	reqPacket := Marshal(channelRequestMsg{PeersID: ch.localId, Request: "x"})
+	for range chanSize * 4 {
+		if err := ch.handlePacket(reqPacket); err != nil {
+			t.Fatalf("handlePacket(channelRequest): %v", err)
+		}
+	}
+	if n := len(ch.incomingRequests); n != 0 {
+		t.Fatalf("incomingRequests should be empty, has %d entries", n)
+	}
+
+	// A close before the confirmation must not remove or close the channel, and
+	// must not emit a close for the still-unknown remote id.
+	if err := ch.handlePacket(Marshal(channelCloseMsg{PeersID: ch.localId})); err != nil {
+		t.Fatalf("handlePacket(channelClose): %v", err)
+	}
+	if m.chanList.getChan(ch.localId) != ch {
+		t.Fatal("premature close removed the channel from the chanList")
+	}
+
+	// The open confirmation is still processed and decides the channel.
+	confirm := Marshal(channelOpenConfirmMsg{
+		PeersID:       ch.localId,
+		MyID:          42,
+		MyWindow:      1 << 20,
+		MaxPacketSize: 1 << 15,
+	})
+	if err := ch.handlePacket(confirm); err != nil {
+		t.Fatalf("handlePacket(openConfirm): %v", err)
+	}
+	if !ch.decided {
+		t.Fatal("channel not decided after open confirmation")
+	}
+	if _, ok := (<-ch.msg).(*channelOpenConfirmMsg); !ok {
+		t.Fatal("open confirmation was not delivered on ch.msg")
+	}
+}
+
+func TestChannelUndecidedInboundDropsRequests(t *testing.T) {
+	// Channel requests on an inbound channel the local application has not
+	// accepted or rejected yet are dropped.
+	serverMux, clientMux := muxPair()
+	defer serverMux.Close()
+	defer clientMux.Close()
+	go DiscardRequests(serverMux.incomingRequests)
+
+	// The server assigns its first inbound channel id 0; open such a channel
+	// and flood it before it is decided. The channel is left undecided, as it
+	// would be in the window before the server accepts or rejects it: its
+	// NewChannel is never received from incomingChannels.
+	ch := clientMux.newChannel("chan", channelOutbound, nil)
+	if err := clientMux.sendMessage(channelOpenMsg{
+		ChanType:      "chan",
+		PeersWindow:   ch.myWindow,
+		MaxPacketSize: ch.maxIncomingPayload,
+		PeersID:       ch.localId,
+	}); err != nil {
+		t.Fatalf("send open: %v", err)
+	}
+	for range chanSize * 4 {
+		if err := clientMux.sendMessage(channelRequestMsg{PeersID: 0, Request: "x"}); err != nil {
+			break // the server may have closed the connection
+		}
+	}
+
+	// The server loop keeps reading: closing the client makes it observe EOF
+	// and return from Wait.
+	clientMux.Close()
+	serverMux.Wait()
+}
+
+func TestChannelRejectedInboundDropsTraffic(t *testing.T) {
+	// A rejected channel is decided but is never established, and traffic on it
+	// is dropped.
+	a, b := memPipe()
+	defer a.Close()
+	defer b.Close()
+	go func() {
+		for {
+			if _, err := b.readPacket(); err != nil {
+				return
+			}
+		}
+	}()
+
+	m := newMux(a)
+	ch := m.newChannel("session", channelInbound, nil)
+	ch.remoteId = 42
+
+	if err := ch.Reject(ConnectionFailed, "no thanks"); err != nil {
+		t.Fatalf("Reject: %v", err)
+	}
+	if !ch.decided {
+		t.Fatal("a rejected channel should be decided")
+	}
+	if ch.established.Load() {
+		t.Fatal("a rejected channel should not be established")
+	}
+
+	// Flooding channel requests must not block.
+	reqPacket := Marshal(channelRequestMsg{PeersID: ch.localId, Request: "x"})
+	for range chanSize * 4 {
+		if err := ch.handlePacket(reqPacket); err != nil {
+			t.Fatalf("handlePacket(channelRequest): %v", err)
+		}
+	}
+	if n := len(ch.incomingRequests); n != 0 {
+		t.Fatalf("incomingRequests should be empty, has %d entries", n)
+	}
+}
+
 func TestChannelConcurrentRequests(t *testing.T) {
 	writer, reader, mux := channelPair(t)
 	defer writer.Close()
