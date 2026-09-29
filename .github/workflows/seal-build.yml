@@ -1,0 +1,77 @@
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional go test package selector; empty runs the full suite"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: false
+      - name: Build module zip helper
+        run: |
+          set -eux
+          HELPER=$(mktemp -d)
+          cp "$GITHUB_WORKSPACE/.github/create_mod.go" "$HELPER/"
+          cd "$HELPER"
+          go mod init example.com/createmod
+          go get golang.org/x/mod@v0.24.0
+          go build -o "$RUNNER_TEMP/create_mod" .
+      - name: Create module zip
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/out"
+          rm -rf "$GITHUB_WORKSPACE/.github"
+          "$RUNNER_TEMP/create_mod" golang.org/x/crypto v0.52.0 "$GITHUB_WORKSPACE" "$RUNNER_TEMP/out/v0.52.0.zip"
+          unzip -l "$RUNNER_TEMP/out/v0.52.0.zip" | tail -n 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.52.0.zip
+          if-no-files-found: error
+
+  test:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: false
+      - name: Build
+        run: |
+          set -eux
+          go version
+          go build ./...
+      - name: Test
+        run: |
+          set -eux
+          SKIP_ARGS=""
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            # macOS $TMPDIR is too long for ssh-agent's Unix socket path (104-byte sun_path limit).
+            export TMPDIR="$(mktemp -d /tmp/g.XXXX)"
+            # sshd on the non-root macOS runner cannot create a BSM audit session for Unix-socket connections.
+            SKIP_ARGS="-skip ^TestDialUnix$"
+          fi
+          go test $SKIP_ARGS ${{ inputs.test-filter || './...' }}
